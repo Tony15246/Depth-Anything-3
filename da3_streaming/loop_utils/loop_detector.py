@@ -18,7 +18,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-import faiss
 import torch
 import torchvision.transforms as T
 from PIL import Image
@@ -244,15 +243,17 @@ class LoopDetector:
         if self.descriptors is None:
             self.extract_descriptors()
 
-        embed_size = self.descriptors.shape[1]
-        faiss_index = faiss.IndexFlatIP(embed_size)
-
-        normalized_descriptors = self.descriptors.numpy()
-        faiss_index.add(normalized_descriptors)
-
-        similarities, indices = faiss_index.search(
-            normalized_descriptors, self.top_k + 1
-        )  # +1 because self is most similar
+        # Using PyTorch instead of Faiss to avoid Numpy 2.x compatibility issues
+        normalized_descriptors = self.descriptors.float().to(self.device)
+        
+        # Calculate similarity matrix (inner product)
+        similarity_matrix = torch.matmul(normalized_descriptors, normalized_descriptors.T)
+        
+        # Get top-k similarities and indices
+        similarities, indices = torch.topk(similarity_matrix, self.top_k + 1, dim=1)
+        
+        similarities = similarities.cpu().numpy()
+        indices = indices.cpu().numpy()
 
         loop_closures = []
         for i in range(len(self.descriptors)):

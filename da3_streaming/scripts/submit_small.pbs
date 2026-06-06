@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -N da3_small
+#PBS -l select=1:ngpus=1:ncpus=12:mem=96gb
+#PBS -l walltime=144:00:00
+#PBS -P CFP04-CF-039
+#PBS -j oe
+#PBS -o /scratch/e1520508/Depth-Anything-3/da3_streaming/scripts/pbs_logs/
+
+# Submit with:
+#   qsub -v LANE_START=<k>[,NUM_GPUS=1,PROCS_PER_GPU=4][,MAX_VIDEOS=<n>] submit_small.pbs
+#
+# Spawns NUM_GPUS * PROCS_PER_GPU workers, one per lane (round-robin on GPUs).
+# Defaults: NUM_GPUS=1, PROCS_PER_GPU=1  (legacy single-lane behaviour).
+#
+# Example: 1 GPU x 4 procs covering lanes 0-3:
+#   qsub -v LANE_START=0,PROCS_PER_GPU=4 submit_small.pbs
+
+source ~/.bashrc
+cd /scratch/e1520508/Depth-Anything-3
+conda activate Depth-Anything-3
+set -u
+
+cd /scratch/e1520508/Depth-Anything-3/da3_streaming
+mkdir -p scripts/pbs_logs
+
+: "${LANE_START:?LANE_START env var required}"
+: "${NUM_GPUS:=1}"
+: "${PROCS_PER_GPU:=1}"
+LANES_PER_JOB=$((NUM_GPUS * PROCS_PER_GPU))
+export MAX_VIDEOS="${MAX_VIDEOS:-}"
+
+echo "=== PBS small lane_start=${LANE_START} num_gpus=${NUM_GPUS} procs_per_gpu=${PROCS_PER_GPU} lanes_per_job=${LANES_PER_JOB} MAX_VIDEOS=${MAX_VIDEOS} ==="
+nvidia-smi | head -12
+
+pids=()
+for off in $(seq 0 $((LANES_PER_JOB - 1))); do
+    LANE=$((LANE_START + off))
+    GPU=$((off % NUM_GPUS))
+    LOG="scripts/pbs_logs/small_${PBS_JOBID:-shell$$}_lane${LANE}_gpu${GPU}.log"
+    echo "Spawning lane=${LANE} on GPU=${GPU} (worker ${off}/${LANES_PER_JOB}), log=${LOG}"
+    (
+        export CUDA_VISIBLE_DEVICES=${GPU}
+        export LANE=${LANE}
+        bash scripts/run_lane.sh
+    ) >"${LOG}" 2>&1 &
+    pids+=($!)
+    # Stagger init so torch/triton don't slam GPU simultaneously.
+    sleep 3
+done
+
+echo "Spawned ${#pids[@]} lane workers, waiting..."
+fail=0
+for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+        fail=$((fail + 1))
+    fi
+done
+
+echo "All workers finished; failed workers=${fail}"
+exit ${fail}

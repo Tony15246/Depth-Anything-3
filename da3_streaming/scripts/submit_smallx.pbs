@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -N da3_smallx
+#PBS -l select=1:ngpus=1:ncpus=8:mem=64gb
+#PBS -l walltime=72:00:00
+#PBS -P CFP04-CF-039
+#PBS -j oe
+#PBS -o /scratch/e1520508/Depth-Anything-3/da3_streaming/scripts/pbs_logs/
+
+# Submit with:
+#   qsub -v LANE=<k>[,MAX_VIDEOS=<n>] submit_smallx.pbs
+
+source ~/.bashrc
+cd /scratch/e1520508/Depth-Anything-3
+conda activate Depth-Anything-3
+set -u
+
+cd /scratch/e1520508/Depth-Anything-3/da3_streaming
+mkdir -p scripts/pbs_logs
+
+: "${LANE:?LANE env var required}"
+export LANE
+export MAX_VIDEOS="${MAX_VIDEOS:-}"
+export CUDA_VISIBLE_DEVICES=0
+
+echo "=== PBS smallx lane=${LANE} MAX_VIDEOS=${MAX_VIDEOS} ==="
+nvidia-smi | head -12
+
+bash scripts/run_lane.sh

@@ -1,0 +1,66 @@
+#!/bin/bash
+#PBS -N da3_medium
+#PBS -l select=1:ngpus=4:ncpus=48:mem=180gb
+#PBS -l walltime=72:00:00
+#PBS -P CFP04-CF-039
+#PBS -j oe
+#PBS -o /scratch/e1520508/Depth-Anything-3/da3_streaming/scripts/pbs_logs/
+
+# Submit with:
+#   qsub -v LANE_START=<k>[,NUM_GPUS=4,PROCS_PER_GPU=2] submit_medium.pbs
+#
+# Defaults: NUM_GPUS=4, PROCS_PER_GPU=2 (= 8 lanes, matches the #PBS select above).
+# IMPORTANT: NUM_GPUS env must match the ngpus in `#PBS -l select` (PBS allocates
+# based on the header, not the env). To use 7 GPUs instead, override at submit:
+#   qsub -l select=1:ngpus=7:ncpus=84:mem=180gb \
+#        -v LANE_START=<k>,NUM_GPUS=7,PROCS_PER_GPU=2 submit_medium.pbs
+#
+# Spawns NUM_GPUS * PROCS_PER_GPU workers in parallel. Lanes are assigned in
+# round-robin fashion over GPUs:
+#     worker off  -> LANE = LANE_START + off
+#                    GPU  = off % NUM_GPUS
+# so each GPU runs PROCS_PER_GPU concurrent lanes (each on a different video).
+
+source ~/.bashrc
+cd /scratch/e1520508/Depth-Anything-3
+conda activate Depth-Anything-3
+set -u
+
+cd /scratch/e1520508/Depth-Anything-3/da3_streaming
+mkdir -p scripts/pbs_logs
+
+: "${LANE_START:?LANE_START env var required}"
+: "${NUM_GPUS:=7}"
+: "${PROCS_PER_GPU:=2}"
+LANES_PER_JOB=$((NUM_GPUS * PROCS_PER_GPU))
+export MAX_VIDEOS="${MAX_VIDEOS:-}"
+
+echo "=== PBS medium lane_start=${LANE_START} num_gpus=${NUM_GPUS} procs_per_gpu=${PROCS_PER_GPU} lanes_per_job=${LANES_PER_JOB} MAX_VIDEOS=${MAX_VIDEOS} ==="
+nvidia-smi | head -12
+
+pids=()
+for off in $(seq 0 $((LANES_PER_JOB - 1))); do
+    LANE=$((LANE_START + off))
+    GPU=$((off % NUM_GPUS))
+    LOG="scripts/pbs_logs/medium_${PBS_JOBID:-shell$$}_lane${LANE}_gpu${GPU}.log"
+    echo "Spawning lane=${LANE} on GPU=${GPU} (worker ${off}/${LANES_PER_JOB}), log=${LOG}"
+    (
+        export CUDA_VISIBLE_DEVICES=${GPU}
+        export LANE=${LANE}
+        bash scripts/run_lane.sh
+    ) >"${LOG}" 2>&1 &
+    pids+=($!)
+    # Tiny stagger so the workers don't all hit conda/PyTorch import at once.
+    sleep 1
+done
+
+echo "Spawned ${#pids[@]} lane workers, waiting..."
+fail=0
+for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+        fail=$((fail + 1))
+    fi
+done
+
+echo "All workers finished; failed workers=${fail}"
+exit ${fail}
