@@ -33,3 +33,10 @@ input_images*/
 src/debug_main.py
 temp*.png
 /outputs
+
+# Large model/data files (skip for opencode indexing)
+*.safetensors
+*.ckpt
+*.npy
+*.mp4
+depth_output/
