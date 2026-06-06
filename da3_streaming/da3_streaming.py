@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 from datetime import datetime
+import cv2
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -190,6 +191,22 @@ class DA3_Streaming:
 
         self.loop_enable = self.config["Model"]["loop_enable"]
 
+        # Accumulator for depth/conf results across all chunks.
+        # Maps global frame index -> dict(image, depth, conf, intrinsics).
+        # A single combined .npz is written by finalize_depth_output() at the end.
+        self.depth_frames = {}
+
+        # Video export options (override config from CLI if provided).
+        self.save_depth_video = self.config["Model"].get("save_depth_video", False)
+        self.depth_video_fps = int(self.config["Model"].get("depth_video_fps", 30))
+
+        # Output selection / precision options (overridable from CLI via config).
+        self.no_save_pcd = bool(self.config["Model"].get("no_save_pcd", False))
+        self.include_image_in_npz = bool(self.config["Model"].get("include_image_in_npz", True))
+        self.include_conf_in_npz = bool(self.config["Model"].get("include_conf_in_npz", True))
+        self.depth_dtype = str(self.config["Model"].get("depth_dtype", "float32"))
+        self.conf_dtype = str(self.config["Model"].get("conf_dtype", "float32"))
+
         if self.loop_enable:
             loop_info_save_path = os.path.join(save_dir, "loop_closures.txt")
             self.loop_detector = LoopDetector(
@@ -205,50 +222,160 @@ class DA3_Streaming:
         return loop_list
 
     def save_depth_conf_result(self, predictions, chunk_idx, s, R, T):
+        """Accumulate per-frame depth/conf into self.depth_frames.
+
+        Frames are kept in memory keyed by their global index. A single combined
+        .npz (and optional .mp4 visualization) is written later by
+        finalize_depth_output().
+        """
         if not self.config["Model"]["save_depth_conf_result"]:
             return
-        os.makedirs(self.result_output_dir, exist_ok=True)
 
         chunk_start, chunk_end = self.chunk_indices[chunk_idx]
+        num_chunks = len(self.chunk_indices)
 
-        if chunk_idx == 0:
+        if num_chunks == 1:
+            # Single-chunk video: keep every frame.
+            save_indices = list(range(0, chunk_end - chunk_start))
+        elif chunk_idx == 0:
             save_indices = list(range(0, chunk_end - chunk_start - self.overlap_e))
-        elif chunk_idx == len(self.chunk_indices) - 1:
+        elif chunk_idx == num_chunks - 1:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start))
         else:
             save_indices = list(range(self.overlap_s, chunk_end - chunk_start - self.overlap_e))
 
-        print("[save_depth_conf_result] save_indices:")
+        print(f"[save_depth_conf_result] accumulating frames {save_indices[0] + chunk_start} "
+              f"... {save_indices[-1] + chunk_start} (chunk {chunk_idx})")
 
+        save_debug = self.config["Model"]["save_debug_info"]
         for local_idx in save_indices:
             global_idx = chunk_start + local_idx
-            print(f"{global_idx}, ", end="")
-
-            image = predictions.processed_images[local_idx]  # [H, W, 3] uint8
-            depth = predictions.depth[local_idx]  # [H, W] float32
-            conf = predictions.conf[local_idx]  # [H, W] float32
-            intrinsics = predictions.intrinsics[local_idx]  # [3, 3] float32
-
-            filename = f"frame_{global_idx}.npz"
-            filepath = os.path.join(self.result_output_dir, filename)
-
-            if self.config["Model"]["save_debug_info"]:
-                np.savez_compressed(
-                    filepath,
-                    image=image,
-                    depth=depth,
-                    conf=conf,
-                    intrinsics=intrinsics,
-                    extrinsics=predictions.extrinsics[local_idx],
-                    s=s,
-                    R=R,
-                    T=T,
+            entry = {
+                "image": np.asarray(predictions.processed_images[local_idx]),
+                "depth": np.asarray(predictions.depth[local_idx]),
+                "conf": np.asarray(predictions.conf[local_idx]),
+                "intrinsics": np.asarray(predictions.intrinsics[local_idx]),
+            }
+            if save_debug:
+                entry.update(
+                    {
+                        "extrinsics": np.asarray(predictions.extrinsics[local_idx]),
+                        "s": np.asarray(s),
+                        "R": np.asarray(R),
+                        "T": np.asarray(T),
+                    }
                 )
-            else:
-                np.savez_compressed(
-                    filepath, image=image, depth=depth, conf=conf, intrinsics=intrinsics
-                )
-        print("")
+            self.depth_frames[global_idx] = entry
+
+    def finalize_depth_output(self):
+        """Write all accumulated frames into one combined .npz (and optional .mp4)."""
+        if not self.config["Model"]["save_depth_conf_result"]:
+            return
+        if len(self.depth_frames) == 0:
+            print("[finalize_depth_output] No frames accumulated, skipping.")
+            return
+
+        os.makedirs(self.result_output_dir, exist_ok=True)
+
+        indices = sorted(self.depth_frames.keys())
+        frame_indices = np.asarray(indices, dtype=np.int64)
+
+        depths = np.stack([self.depth_frames[i]["depth"] for i in indices], axis=0)
+        intrinsics = np.stack([self.depth_frames[i]["intrinsics"] for i in indices], axis=0)
+
+        # Optional fields.
+        images = None
+        confs = None
+        if self.include_image_in_npz:
+            images = np.stack([self.depth_frames[i]["image"] for i in indices], axis=0)
+        if self.include_conf_in_npz:
+            confs = np.stack([self.depth_frames[i]["conf"] for i in indices], axis=0)
+
+        # Cast dtypes.
+        depths_out = depths.astype(np.float16) if self.depth_dtype == "float16" else depths.astype(np.float32)
+        if confs is not None:
+            confs_out = confs.astype(np.float16) if self.conf_dtype == "float16" else confs.astype(np.float32)
+        else:
+            confs_out = None
+
+        out_path = os.path.join(self.result_output_dir, "frames.npz")
+        msg = (
+            f"[finalize_depth_output] Writing combined npz: {out_path}\n"
+            f"  frames={len(indices)}, depth={depths_out.shape}/{depths_out.dtype}"
+        )
+        if confs_out is not None:
+            msg += f", conf={confs_out.shape}/{confs_out.dtype}"
+        if images is not None:
+            msg += f", image={images.shape}/{images.dtype}"
+        print(msg)
+
+        save_kwargs = dict(
+            depth=depths_out,
+            intrinsics=intrinsics,
+            frame_indices=frame_indices,
+        )
+        if confs_out is not None:
+            save_kwargs["conf"] = confs_out
+        if images is not None:
+            save_kwargs["image"] = images
+        if self.config["Model"]["save_debug_info"]:
+            save_kwargs["extrinsics"] = np.stack(
+                [self.depth_frames[i]["extrinsics"] for i in indices], axis=0
+            )
+            save_kwargs["s"] = np.stack(
+                [self.depth_frames[i]["s"] for i in indices], axis=0
+            )
+            save_kwargs["R"] = np.stack(
+                [self.depth_frames[i]["R"] for i in indices], axis=0
+            )
+            save_kwargs["T"] = np.stack(
+                [self.depth_frames[i]["T"] for i in indices], axis=0
+            )
+        np.savez_compressed(out_path, **save_kwargs)
+        print(f"[finalize_depth_output] Saved {out_path} "
+              f"({os.path.getsize(out_path) / 1024 / 1024:.1f} MB)")
+
+        if self.save_depth_video:
+            video_path = os.path.join(self.result_output_dir, "depth_video.mp4")
+            # Use full-precision depths for visualization regardless of stored dtype.
+            self._save_depth_video(depths, video_path, fps=self.depth_video_fps)
+
+        # Free memory.
+        self.depth_frames.clear()
+
+    def _save_depth_video(self, depths, out_path, fps=30):
+        """Render a depth-map video using inverse-depth + TURBO colormap.
+
+        Normalization uses 2nd-98th percentile of disparity (1/depth) across the
+        whole sequence for a stable, flicker-free visualization.
+        """
+        N, H, W = depths.shape
+        d = np.asarray(depths, dtype=np.float32)
+        valid = d > 0
+        if not np.any(valid):
+            print("[_save_depth_video] No valid depth, skipping mp4.")
+            return
+
+        disp = np.where(valid, 1.0 / np.clip(d, 1e-6, None), 0.0)
+        vmin, vmax = np.percentile(disp[valid], [2.0, 98.0])
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+        if not writer.isOpened():
+            print(f"[_save_depth_video] Failed to open writer for {out_path}")
+            return
+
+        for i in range(N):
+            norm = np.clip((disp[i] - vmin) / (vmax - vmin), 0.0, 1.0)
+            u8 = (norm * 255.0).astype(np.uint8)
+            colored = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
+            writer.write(colored)
+        writer.release()
+        print(f"[_save_depth_video] Saved {out_path} "
+              f"({os.path.getsize(out_path) / 1024 / 1024:.1f} MB, "
+              f"{N} frames @ {fps} fps)")
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
         start_idx, end_idx = range_1
@@ -270,7 +397,11 @@ class DA3_Streaming:
                 images = chunk_image_paths
                 # images: ['xxx.png', 'xxx.png', ...]
 
-                predictions = self.model.inference(images, ref_view_strategy=ref_view_strategy)
+                predictions = self.model.inference(
+                    images,
+                    ref_view_strategy=ref_view_strategy,
+                    process_res=560,  # 1280x704 -> 560x308, preserves aspect ratio (divisible by patch_size=14)
+                )
 
                 predictions.depth = np.squeeze(predictions.depth)
                 predictions.conf -= 1.0
@@ -625,6 +756,32 @@ class DA3_Streaming:
 
         print("Apply alignment")
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
+
+        # Single-chunk case: no alignment loop runs, but we still want depth output.
+        if len(self.chunk_indices) == 1:
+            chunk_data_only = np.load(
+                os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
+            ).item()
+            if not self.no_save_pcd:
+                points_only = depth_to_point_cloud_vectorized(
+                    chunk_data_only.depth,
+                    chunk_data_only.intrinsics,
+                    chunk_data_only.extrinsics,
+                )
+                save_confident_pointcloud_batch(
+                    points=points_only,
+                    colors=chunk_data_only.processed_images,
+                    confs=chunk_data_only.conf,
+                    output_path=os.path.join(self.pcd_dir, "0_pcd.ply"),
+                    conf_threshold=np.mean(chunk_data_only.conf)
+                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                )
+            if self.config["Model"]["save_depth_conf_result"]:
+                self.save_depth_conf_result(
+                    chunk_data_only, 0, 1, np.eye(3), np.array([0, 0, 0])
+                )
+
         for chunk_idx in range(len(self.chunk_indices) - 1):
             print(f"Applying {chunk_idx+1} -> {chunk_idx} (Total {len(self.chunk_indices)-1})")
             s, R, t = self.sim3_list[chunk_idx]
@@ -654,45 +811,49 @@ class DA3_Streaming:
                     os.path.join(self.result_unaligned_dir, "chunk_0.npy"), allow_pickle=True
                 ).item()
                 np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
-                points_first = depth_to_point_cloud_vectorized(
-                    chunk_data_first.depth,
-                    chunk_data_first.intrinsics,
-                    chunk_data_first.extrinsics,
-                )
-                colors_first = chunk_data_first.processed_images
-                confs_first = chunk_data_first.conf
-                ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
-                save_confident_pointcloud_batch(
-                    points=points_first,  # shape: (H, W, 3)
-                    colors=colors_first,  # shape: (H, W, 3)
-                    confs=confs_first,  # shape: (H, W)
-                    output_path=ply_path_first,
-                    conf_threshold=np.mean(confs_first)
-                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-                )
+                if not self.no_save_pcd:
+                    points_first = depth_to_point_cloud_vectorized(
+                        chunk_data_first.depth,
+                        chunk_data_first.intrinsics,
+                        chunk_data_first.extrinsics,
+                    )
+                    colors_first = chunk_data_first.processed_images
+                    confs_first = chunk_data_first.conf
+                    ply_path_first = os.path.join(self.pcd_dir, "0_pcd.ply")
+                    save_confident_pointcloud_batch(
+                        points=points_first,  # shape: (H, W, 3)
+                        colors=colors_first,  # shape: (H, W, 3)
+                        confs=confs_first,  # shape: (H, W)
+                        output_path=ply_path_first,
+                        conf_threshold=np.mean(confs_first)
+                        * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                        sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                    )
                 if self.config["Model"]["save_depth_conf_result"]:
                     predictions = chunk_data_first
                     self.save_depth_conf_result(predictions, 0, 1, np.eye(3), np.array([0, 0, 0]))
 
-            points = aligned_chunk_data["world_points"].reshape(-1, 3)
-            colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
-            confs = aligned_chunk_data["conf"].reshape(-1)
-            ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
-            save_confident_pointcloud_batch(
-                points=points,  # shape: (H, W, 3)
-                colors=colors,  # shape: (H, W, 3)
-                confs=confs,  # shape: (H, W)
-                output_path=ply_path,
-                conf_threshold=np.mean(confs)
-                * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
-                sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
-            )
+            if not self.no_save_pcd:
+                points = aligned_chunk_data["world_points"].reshape(-1, 3)
+                colors = (aligned_chunk_data["images"].reshape(-1, 3)).astype(np.uint8)
+                confs = aligned_chunk_data["conf"].reshape(-1)
+                ply_path = os.path.join(self.pcd_dir, f"{chunk_idx+1}_pcd.ply")
+                save_confident_pointcloud_batch(
+                    points=points,  # shape: (H, W, 3)
+                    colors=colors,  # shape: (H, W, 3)
+                    confs=confs,  # shape: (H, W)
+                    output_path=ply_path,
+                    conf_threshold=np.mean(confs)
+                    * self.config["Model"]["Pointcloud_Save"]["conf_threshold_coef"],
+                    sample_ratio=self.config["Model"]["Pointcloud_Save"]["sample_ratio"],
+                )
 
             if self.config["Model"]["save_depth_conf_result"]:
                 predictions = chunk_data
                 predictions.depth *= s
                 self.save_depth_conf_result(predictions, chunk_idx + 1, s, R, t)
+
+        self.finalize_depth_output()
 
         self.save_camera_poses()
 
@@ -737,9 +898,14 @@ class DA3_Streaming:
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
 
-        for i, idx in enumerate(
-            range(first_chunk_range[0], first_chunk_range[1] - self.overlap_e)
-        ):
+        # When there's only one chunk, don't trim the overlap_e suffix (otherwise
+        # range(0, -overlap_e) is empty and the rest of the file is left as None).
+        first_chunk_end = (
+            first_chunk_range[1]
+            if len(self.all_camera_poses) == 1
+            else first_chunk_range[1] - self.overlap_e
+        )
+        for i, idx in enumerate(range(first_chunk_range[0], first_chunk_end)):
             w2c = np.eye(4)
             w2c[:3, :] = first_chunk_extrinsics[i]
             c2w = np.linalg.inv(w2c)
@@ -889,9 +1055,80 @@ if __name__ == "__main__":
         help="Image path",
     )
     parser.add_argument("--output_dir", type=str, required=False, default=None, help="Output path")
+    parser.add_argument(
+        "--save_depth_video",
+        action="store_true",
+        help="Also render a color-mapped depth-map mp4 alongside the combined npz.",
+    )
+    parser.add_argument(
+        "--depth_video_fps",
+        type=int,
+        default=None,
+        help="Frame rate for the depth-map mp4 (overrides Model.depth_video_fps in config).",
+    )
+    parser.add_argument(
+        "--no_save_pcd",
+        action="store_true",
+        help="Skip per-chunk point-cloud (.ply) generation and the combined ply merge.",
+    )
+    parser.add_argument(
+        "--include_image",
+        dest="include_image",
+        action="store_true",
+        help="Include processed_images in the combined npz (default: include).",
+    )
+    parser.add_argument(
+        "--no_include_image",
+        dest="include_image",
+        action="store_false",
+        help="Drop processed_images from the combined npz.",
+    )
+    parser.set_defaults(include_image=None)
+    parser.add_argument(
+        "--include_conf",
+        dest="include_conf",
+        action="store_true",
+        help="Include conf in the combined npz (default: include).",
+    )
+    parser.add_argument(
+        "--no_include_conf",
+        dest="include_conf",
+        action="store_false",
+        help="Drop conf from the combined npz.",
+    )
+    parser.set_defaults(include_conf=None)
+    parser.add_argument(
+        "--depth_dtype",
+        type=str,
+        choices=["float16", "float32"],
+        default=None,
+        help="Dtype used to store depth in the combined npz.",
+    )
+    parser.add_argument(
+        "--conf_dtype",
+        type=str,
+        choices=["float16", "float32"],
+        default=None,
+        help="Dtype used to store conf in the combined npz.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    # CLI flags override config values.
+    if args.save_depth_video:
+        config["Model"]["save_depth_video"] = True
+    if args.depth_video_fps is not None:
+        config["Model"]["depth_video_fps"] = args.depth_video_fps
+    if args.no_save_pcd:
+        config["Model"]["no_save_pcd"] = True
+    if args.include_image is not None:
+        config["Model"]["include_image_in_npz"] = args.include_image
+    if args.include_conf is not None:
+        config["Model"]["include_conf_in_npz"] = args.include_conf
+    if args.depth_dtype is not None:
+        config["Model"]["depth_dtype"] = args.depth_dtype
+    if args.conf_dtype is not None:
+        config["Model"]["conf_dtype"] = args.conf_dtype
 
     image_dir = args.image_dir
     path = image_dir.split("/")
@@ -919,9 +1156,12 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     gc.collect()
 
-    all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
-    input_dir = os.path.join(save_dir, "pcd")
-    print("Saving all the point clouds")
-    merge_ply_files(input_dir, all_ply_path)
-    print("DA3-Streaming done.")
+    if config["Model"].get("no_save_pcd", False):
+        print("DA3-Streaming done. (point clouds disabled)")
+    else:
+        all_ply_path = os.path.join(save_dir, "pcd/combined_pcd.ply")
+        input_dir = os.path.join(save_dir, "pcd")
+        print("Saving all the point clouds")
+        merge_ply_files(input_dir, all_ply_path)
+        print("DA3-Streaming done.")
     sys.exit()
